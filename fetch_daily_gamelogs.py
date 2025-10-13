@@ -177,22 +177,15 @@ def process_single_game_data(game_dict, game_id_str, team_id_map):
 
 def check_and_process_games(engine, team_id_map):
     processed_game_ids = load_processed_games_from_db(engine)
+    utc_now = datetime.now(timezone.utc)
     
-    # --- START: Temporary Backfill Logic ---
-    # Define the date range to backfill, from the day after your last entry.
-    start_date = datetime(2025, 9, 29, tzinfo=timezone.utc)
-    end_date = datetime.now(timezone.utc) # This will go up to today
-    
-    game_dates_to_query = []
-    current_date = start_date
-    while current_date <= end_date:
-        game_dates_to_query.append(current_date.strftime('%m/%d/%Y'))
-        current_date += timedelta(days=1)
-    
-    logging.info(f"--- BACKFILL MODE ---: Checking for games from {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}.")
+    api_query_date_utc_today = utc_now.strftime('%m/%d/%Y')
+    api_query_date_utc_yesterday = (utc_now - timedelta(days=1)).strftime('%m/%d/%Y')
+
+    logging.info(f"Checking for games. API query dates (UTC): {api_query_date_utc_yesterday}, {api_query_date_utc_today}")
 
     all_fetched_games_dict = {}
-    # --- END: Temporary Backfill Logic ---
+    game_dates_to_query = [api_query_date_utc_yesterday, api_query_date_utc_today]
 
     for query_date_str in game_dates_to_query:
         try:
