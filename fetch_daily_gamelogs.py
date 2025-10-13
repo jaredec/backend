@@ -35,9 +35,6 @@ except Exception as e:
     exit(1)
 
 # --- Define Columns for DataFrame and Database Insertion ---
-# Now includes the numeric team ID columns. Note: The text franchise codes are still included
-# to populate the original 'visitor_team' and 'home_team' text columns for now. You can remove
-# them from here and from the process_single_game_data return value if you drop those columns from your database table.
 COLUMNS = ["game_id", "date", "visitor_team", "home_team", "visitor_score", "home_score", "visitor_team_id", "home_team_id"]
 TEAMS_CSV_PATH = "teams_with_franchise.csv"
 
@@ -105,12 +102,10 @@ def load_processed_games_from_db(engine):
     return processed_ids
 
 def load_team_id_map(engine):
-    """Queries the teams table to create a mapping from franchise code to team_id."""
     team_id_map = {}
     try:
         with engine.connect() as connection:
             result = connection.execute(text("SELECT team, team_id FROM public.teams"))
-            # Using _mapping directly to handle potential tuple/KeyedTuple from different driver versions
             for row in result:
                 team_id_map[row._mapping['team']] = row._mapping['team_id']
         logging.info(f"Successfully loaded {len(team_id_map)} team IDs into map.")
@@ -133,7 +128,6 @@ def process_single_game_data(game_dict, game_id_str, team_id_map):
 
     try:
         game_date_dt = datetime.strptime(api_game_date_value, '%Y-%m-%d')
-        # Format for DATE column in PostgreSQL
         game_date_db = game_date_dt.strftime('%Y-%m-%d')
     except ValueError:
         logging.warning(f"Invalid date format for game_date '{api_game_date_value}' for Game ID {game_id_str}. Skipping.")
@@ -162,7 +156,6 @@ def process_single_game_data(game_dict, game_id_str, team_id_map):
         logging.warning(f"No mapping for home team '{home_full}' (Game ID: {game_id_str}). Skipping.")
         return None
     
-    # Look up numeric team IDs from the pre-loaded map
     visitor_team_id = team_id_map.get(visitor_team_franchise)
     home_team_id = team_id_map.get(home_team_franchise)
 
@@ -184,15 +177,22 @@ def process_single_game_data(game_dict, game_id_str, team_id_map):
 
 def check_and_process_games(engine, team_id_map):
     processed_game_ids = load_processed_games_from_db(engine)
-    utc_now = datetime.now(timezone.utc)
     
-    api_query_date_utc_today = utc_now.strftime('%m/%d/%Y')
-    api_query_date_utc_yesterday = (utc_now - timedelta(days=1)).strftime('%m/%d/%Y')
-
-    logging.info(f"Checking for games. API query dates (UTC): {api_query_date_utc_yesterday}, {api_query_date_utc_today}")
+    # --- START: Temporary Backfill Logic ---
+    # Define the date range to backfill, from the day after your last entry.
+    start_date = datetime(2025, 9, 29, tzinfo=timezone.utc)
+    end_date = datetime.now(timezone.utc) # This will go up to today
+    
+    game_dates_to_query = []
+    current_date = start_date
+    while current_date <= end_date:
+        game_dates_to_query.append(current_date.strftime('%m/%d/%Y'))
+        current_date += timedelta(days=1)
+    
+    logging.info(f"--- BACKFILL MODE ---: Checking for games from {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}.")
 
     all_fetched_games_dict = {}
-    game_dates_to_query = [api_query_date_utc_yesterday, api_query_date_utc_today]
+    # --- END: Temporary Backfill Logic ---
 
     for query_date_str in game_dates_to_query:
         try:
@@ -220,10 +220,12 @@ def check_and_process_games(engine, team_id_map):
             game_status_lower == 'game over' or \
             game_status_lower == 'completed'
         )
-        is_regular_season = game_type == 'R'
+        
+        valid_game_types = ['R', 'F', 'D', 'L', 'W']
+        is_valid_game_type = game_type in valid_game_types
 
-        if is_completed_status and is_regular_season and (game_id_str_key not in processed_game_ids):
-            logging.info(f"New final regular season game found: Game ID {game_id_str_key}, Summary: {game_dict_val.get('summary', 'N/A')}")
+        if is_completed_status and is_valid_game_type and (game_id_str_key not in processed_game_ids):
+            logging.info(f"New final game found: Game ID {game_id_str_key}, Summary: {game_dict_val.get('summary', 'N/A')}")
             game_row_data = process_single_game_data(game_dict_val, game_id_str_key, team_id_map)
             if game_row_data:
                 new_games_to_append_data.append(game_row_data)
@@ -231,7 +233,7 @@ def check_and_process_games(engine, team_id_map):
                 found_new_final_game_flag = True
 
     if not new_games_to_append_data:
-        logging.info("No new final regular season games to add to database.")
+        logging.info("No new final games to add to database.")
         return found_new_final_game_flag
 
     df_new = pd.DataFrame(new_games_to_append_data, columns=COLUMNS)
@@ -257,7 +259,6 @@ def regenerate_full_csv(engine):
     csv_path = os.path.join(output_dir, "mlb_franchise_gamelogs.csv")
     logging.info(f"Attempting to save all gamelogs to {csv_path}...")
     try:
-        # Note: If you drop the text team columns, update this query.
         all_games_df = pd.read_sql(
             text("SELECT game_id, date, visitor_team, home_team, visitor_score, home_score FROM public.gamelogs ORDER BY date, game_id"),
             engine
@@ -275,10 +276,8 @@ if __name__ == "__main__":
         logging.critical("Database engine is not initialized. Exiting.")
         exit(1)
         
-    # Load the team ID map once at the beginning of the run
     team_id_lookup = load_team_id_map(ENGINE)
     
-    # Pass the map to the main processing function
     new_games_were_added = check_and_process_games(ENGINE, team_id_lookup)
 
     if new_games_were_added:
