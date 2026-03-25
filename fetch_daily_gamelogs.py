@@ -35,43 +35,7 @@ except Exception as e:
     exit(1)
 
 # --- Define Columns for DataFrame and Database Insertion ---
-COLUMNS = ["game_id", "date", "visitor_team", "home_team", "visitor_score", "home_score", "visitor_team_id", "home_team_id"]
-TEAMS_CSV_PATH = "teams_with_franchise.csv"
-
-# --- Load Team Mappings (for getting franchise code from team name) ---
-try:
-    teams_df = pd.read_csv(TEAMS_CSV_PATH)
-    logging.info(f"Successfully loaded team mappings from {TEAMS_CSV_PATH}.")
-except FileNotFoundError:
-    logging.error(f"{TEAMS_CSV_PATH} not found. Ensure it's in the script's working directory. Script will exit.")
-    exit(1)
-except Exception as e:
-    logging.error(f"Error loading {TEAMS_CSV_PATH}: {e}. Script will exit.")
-    exit(1)
-
-current_year_map = datetime.now(timezone.utc).year
-team_mapping = {}
-full_name_mapping = {}
-for _, row in teams_df.iterrows():
-    if pd.notna(row["FRANCHISE"]):
-        try:
-            first_year = int(row["FIRST"])
-            last_year_str = row["LAST"]
-            if last_year_str == "Present" or pd.isna(last_year_str):
-                last_year_val = current_year_map + 1
-            else:
-                last_year_val = int(last_year_str)
-            if first_year <= current_year_map <= last_year_val:
-                nickname_val = row["NICKNAME"]
-                franchise_val = row["FRANCHISE"]
-                if pd.notna(nickname_val):
-                    team_mapping[str(nickname_val).lower()] = franchise_val
-                    if pd.notna(row["CITY"]):
-                        full_name = f"{row['CITY']} {nickname_val}"
-                        full_name_mapping[full_name.lower()] = franchise_val
-        except (ValueError, TypeError) as e:
-            logging.warning(f"Error processing team row {row.to_dict()}: {e}. Skipping.")
-            continue
+COLUMNS = ["game_id", "date", "game_type", "visitor_team", "home_team", "visitor_score", "home_score", "innings", "visitor_team_id", "home_team_id", "is_negro_league", "source"]
 
 # --- Database Helper Functions ---
 def table_exists(engine, table_name, schema_name='public'):
@@ -102,13 +66,14 @@ def load_processed_games_from_db(engine):
     return processed_ids
 
 def load_team_id_map(engine):
+    """Returns {mlb_api_team_id (int) -> franchise_code (str)}"""
     team_id_map = {}
     try:
         with engine.connect() as connection:
-            result = connection.execute(text("SELECT team, team_id FROM public.teams"))
+            result = connection.execute(text("SELECT team_id, team FROM public.teams"))
             for row in result:
-                team_id_map[row._mapping['team']] = row._mapping['team_id']
-        logging.info(f"Successfully loaded {len(team_id_map)} team IDs into map.")
+                team_id_map[int(row._mapping['team_id'])] = row._mapping['team']
+        logging.info(f"Successfully loaded {len(team_id_map)} team ID mappings from DB.")
     except Exception as e:
         logging.error(f"Failed to load team ID map from database: {e}. Script will exit.")
         exit(1)
@@ -133,39 +98,20 @@ def process_single_game_data(game_dict, game_id_str, team_id_map):
         logging.warning(f"Invalid date format for game_date '{api_game_date_value}' for Game ID {game_id_str}. Skipping.")
         return None
 
-    visitor_full = str(game_dict['away_name'])
-    home_full = str(game_dict['home_name'])
+    away_id = game_dict.get('away_id')
+    home_id = game_dict.get('home_id')
 
-    visitor_team_franchise = full_name_mapping.get(visitor_full.lower())
-    if not visitor_team_franchise:
-        visitor_nickname_parts = visitor_full.split()
-        if visitor_nickname_parts:
-            visitor_nickname = visitor_nickname_parts[-1].lower()
-            visitor_team_franchise = team_mapping.get(visitor_nickname, full_name_mapping.get(visitor_full.lower()))
-    if not visitor_team_franchise:
-        logging.warning(f"No mapping for visitor team '{visitor_full}' (Game ID: {game_id_str}). Skipping.")
+    if away_id is None or home_id is None:
+        logging.warning(f"Game ID {game_id_str} missing team IDs. Skipping.")
         return None
 
-    home_team_franchise = full_name_mapping.get(home_full.lower())
-    if not home_team_franchise:
-        home_nickname_parts = home_full.split()
-        if home_nickname_parts:
-            home_nickname = home_nickname_parts[-1].lower()
-            home_team_franchise = team_mapping.get(home_nickname, full_name_mapping.get(home_full.lower()))
-    if not home_team_franchise:
-        logging.warning(f"No mapping for home team '{home_full}' (Game ID: {game_id_str}). Skipping.")
+    if team_id_map.get(int(away_id)) is None:
+        logging.warning(f"No franchise mapping for away team ID {away_id} (Game ID: {game_id_str}). Skipping.")
         return None
-    
-    visitor_team_id = team_id_map.get(visitor_team_franchise)
-    home_team_id = team_id_map.get(home_team_franchise)
+    if team_id_map.get(int(home_id)) is None:
+        logging.warning(f"No franchise mapping for home team ID {home_id} (Game ID: {game_id_str}). Skipping.")
+        return None
 
-    if visitor_team_id is None:
-        logging.warning(f"Could not find team_id for visitor franchise '{visitor_team_franchise}' (Game ID: {game_id_str}). Skipping.")
-        return None
-    if home_team_id is None:
-        logging.warning(f"Could not find team_id for home franchise '{home_team_franchise}' (Game ID: {game_id_str}). Skipping.")
-        return None
-        
     try:
         away_score_val = int(game_dict['away_score'])
         home_score_val = int(game_dict['home_score'])
@@ -173,7 +119,20 @@ def process_single_game_data(game_dict, game_id_str, team_id_map):
         logging.warning(f"Non-integer score for game (Game ID: {game_id_str}). Skipping.")
         return None
 
-    return [game_id_str, game_date_db, visitor_team_franchise, home_team_franchise, away_score_val, home_score_val, visitor_team_id, home_team_id]
+    game_type         = game_dict.get('game_type', 'R')
+    visitor_team_name = str(game_dict['away_name'])
+    home_team_name    = str(game_dict['home_name'])
+    innings           = game_dict.get('current_inning')
+
+    return [
+        game_id_str, game_date_db, game_type,
+        visitor_team_name, home_team_name,
+        away_score_val, home_score_val,
+        innings,
+        int(away_id), int(home_id),
+        False,
+        'mlb_api',
+    ]
 
 def check_and_process_games(engine, team_id_map):
     processed_game_ids = load_processed_games_from_db(engine)
