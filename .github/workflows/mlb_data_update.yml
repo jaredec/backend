@@ -40,11 +40,3 @@ jobs:
           DB_NAME: ${{ secrets.DB_NAME }}
           DB_PORT: ${{ secrets.DB_PORT }}
         run: python fetch_daily_gamelogs.py # Make sure this is your script name
-
-      - name: Upload Gamelogs CSV as Artifact
-        if: success()
-        uses: actions/upload-artifact@v4
-        with:
-          name: mlb-gamelogs-csv
-          path: outputs/mlb_franchise_gamelogs.csv
-          retention-days: 7
